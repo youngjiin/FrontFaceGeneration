@@ -119,35 +119,34 @@ class Generator(nn.Module):
             nn.ConvTranspose2d(64, config.nc, 4, 2, 1, bias=False),
             nn.Tanh(),
         )
-        self.adain1 = AdaptiveInstanceNorm(1024, 512)
-        self.adain2 = AdaptiveInstanceNorm(512, 512)
-        self.adain3 = AdaptiveInstanceNorm(256, 512)
-        self.adain4 = AdaptiveInstanceNorm(128, 512)
-        self.adain5 = AdaptiveInstanceNorm(64, 512)
+        #style dimension 512 -> 64
+        self.adain1 = AdaptiveInstanceNorm(1024, 64)
+        self.adain2 = AdaptiveInstanceNorm(512, 64)
+        self.adain3 = AdaptiveInstanceNorm(256, 64)
+        self.adain4 = AdaptiveInstanceNorm(128, 64)
+        self.adain5 = AdaptiveInstanceNorm(64, 64)
 
-    def forward(self, x, attr): #attr ( 1, 512)
+    def forward(self, x, attr, style): #attr ( 1, 512)
         attr = attr.view(-1, config.nfeature, 1, 1) #(10, 512, 1, 1)
         x = torch.cat([x, attr], 1) #(10 , 612, 1,1)
 
         x = self.s1(x)
-        x = self.adain1(x, attr.squeeze(3).squeeze(2)) #x:(10, 1024, 4, 4) attr:(10,512,1,1)
+        x = self.adain1(x, style.squeeze(3).squeeze(2)) #x:(10, 1024, 4, 4) attr:(10,512,1,1)
         x = self.s2(x)
-        x = self.adain2(x, attr.squeeze(3).squeeze(2))
+        x = self.adain2(x, style.squeeze(3).squeeze(2))
         x = self.s3(x)
-        x = self.adain3(x, attr.squeeze(3).squeeze(2))
+        x = self.adain3(x, style.squeeze(3).squeeze(2))
         x = self.s4(x)
-        x = self.adain4(x, attr.squeeze(3).squeeze(2))
+        x = self.adain4(x, style.squeeze(3).squeeze(2))
         x = self.s5(x)
-        x = self.adain5(x, attr.squeeze(3).squeeze(2))
+        x = self.adain5(x, style.squeeze(3).squeeze(2))
         return self.s6(x)
 
-
-class Discriminator(nn.Module):
+class StyleEncoder(nn.Module):
     def __init__(self):
-        super(Discriminator, self).__init__()
-        self.feature_input = nn.Linear(config.nfeature, 128 * 128)
+        super(StyleEncoder, self).__init__()
+        self.first = nn.Conv2d(3, 64, 4, 2, 1, bias=False)
         self.main = nn.Sequential(
-            nn.Conv2d(config.nc + 1, 64, 4, 2, 1, bias=False),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(64, 128, 4, 2, 1, bias=False),
             nn.BatchNorm2d(128),
@@ -161,13 +160,45 @@ class Discriminator(nn.Module):
             nn.Conv2d(512, 1024, 4, 2, 1, bias=False),
             nn.BatchNorm2d(1024),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(1024, 1, 4, 1, 0, bias=False),
         )
+        self.last = nn.Conv2d(1024, 64, 4, 1, 0, bias=False)
+
+    def forward(self, x):
+        #update the wieghts
+
+        x = self.first(x)
+        x = self.main(x) #[10, 1024, 4,4]
+        s = self.last(x) #what dimension ?
+        return s
+
+class Discriminator(nn.Module):
+    def __init__(self):
+        super(Discriminator, self).__init__()
+        self.feature_input = nn.Linear(config.nfeature, 128 * 128)
+        self.first = nn.Conv2d(config.nc + 1, 64, 4, 2, 1, bias=False)
+        self.main = nn.Sequential(
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(64, 128, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(128, 256, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(256, 512, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(512, 1024, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(1024),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+        self.last = nn.Conv2d(1024, 1, 4, 1, 0, bias=False)
 
     def forward(self, x, attr):
         attr = self.feature_input(attr).view(-1, 1, 128, 128)
         x = torch.cat([x, attr], 1)
-        return self.main(x).view(-1, 1)
+        x = self.first(x)
+        x = self.main(x)
+        return self.last(x).view(-1, 1)
 
 def get_infinite_batches(data_loader):
     while True:
@@ -178,14 +209,16 @@ class Trainer:
     def __init__(self):
         self.generator = Generator()
         self.discriminator = Discriminator()
+        self.styleencoder = StyleEncoder()
         self.mtcnn = MTCNN(image_size=128, margin=20)
         self.resnet = InceptionResnetV1(pretrained='vggface2').eval()
         self.loss = nn.MSELoss()
         self.optimizer_g = optim.Adam(self.generator.parameters(), lr=config.lr, betas=betas)
         self.optimizer_d = optim.Adam(self.discriminator.parameters(), lr=config.lr, betas=betas)
-
+        self.optimizer_s = optim.Adam(self.styleencoder.parameters(), lr=config.lr, betas=betas)
         self.generator.cuda()
         self.discriminator.cuda()
+        self.styleencoder.cuda()
         self.loss.cuda()
 
     def get_cropped_image(self, image):
@@ -202,7 +235,7 @@ class Trainer:
         embeddings = torch.cat(embeddings)
         return embeddings
 
-    def train(self, ds):
+    def train(self):
         noise = Variable(torch.FloatTensor(config.batch_size, config.nz, 1, 1).cuda())
         label_real = Variable(torch.FloatTensor(config.batch_size, 1).fill_(1).cuda())
         label_fake = Variable(torch.FloatTensor(config.batch_size, 1).fill_(0).cuda())
@@ -229,11 +262,14 @@ class Trainer:
 
                 attr = Variable(attr.cuda())
                 real = Variable(front_image_cropped.cuda())
+                profile_image_cropped = Variable(profile_image_cropped.cuda())
+                front_image_cropped = Variable(front_image_cropped.cuda())
+                style = self.styleencoder(profile_image_cropped)
+                style = Variable(style.cuda())
 
+                #train discriminator
                 d_real = self.discriminator(real, attr)
-
-
-                fake = self.generator(noise, attr)
+                fake = self.generator(noise, attr, style)
                 #fake = torch.clamp(fake, 0, 1)
                 d_fake = self.discriminator(fake.detach(), attr)  # not update generator
 
@@ -241,12 +277,23 @@ class Trainer:
                 d_loss.backward()
                 self.optimizer_d.step()
 
-                # train generator
+                # train generator, styleencoder
                 self.generator.zero_grad()
+                self.styleencoder.zero_grad()
                 d_fake = self.discriminator(fake, attr)
                 g_loss = self.loss(d_fake, label_real)  # trick the fake into being real
-                g_loss.backward()
+
+                s_front_pred = self.styleencoder(fake)
+                #s_front_real = self.styleencoder(front_image_cropped)
+
+                s_loss = torch.mean(torch.abs(s_front_pred- style)) # loss 1
+                #same_loss = torch.mean(torch.abs(style-s_front_real))
+                cyc_loss = torch.mean(torch.abs(fake-front_image_cropped))
+
+                g_s_loss = g_loss + s_loss + cyc_loss # + same_loss
+                g_s_loss.backward()
                 self.optimizer_g.step()
+                self.optimizer_s.step()
                 if i==0:
                     first_person = fake.data
             print("epoch{:03d} d_real: {}, d_fake: {}".format(epoch, d_real.mean(), d_fake.mean()))
@@ -255,11 +302,10 @@ class Trainer:
             vutils.save_image(first_person, '{}/first_person_result_epoch_{:03d}.png'.format(config.result_dir, epoch), normalize=True)
         torch.save(self.generator.state_dict(), 'generator_param.pkl')
         torch.save(self.discriminator.state_dict(), 'discriminator_param.pkl')
+        torch.save(self.styleencoder.state_dict(), 'styleencoder_param.pkl')
 
 import torch.utils.data
 from dataset import *
 
-ds = Dataset(config)
-
 trainer = Trainer()
-trainer.train(ds)
+trainer.train()
