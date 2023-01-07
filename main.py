@@ -1,4 +1,4 @@
-# Also, discriminator could be similar level with Generator
+#nfeature 수 줄이고 , loss 잘못된거 고치고, generator conv2d로만
 
 #residual version
 import argparse
@@ -13,7 +13,7 @@ parser.add_argument('--batch_size', type=int, default=10)
 parser.add_argument('--nepoch', type=int, default=100)
 parser.add_argument('--nz', type=int, default=100) # number of noise dimension
 parser.add_argument('--nc', type=int, default=3) # number of result channel
-parser.add_argument('--nfeature', type=int, default=512) # num of embedding
+parser.add_argument('--nfeature', type=int, default=64) # num of embedding
 parser.add_argument('--lr', type=float, default=0.0002)
 betas = (0.0, 0.99) # adam optimizer beta1, beta2
 
@@ -44,30 +44,21 @@ class ResidualBlock(nn.Module):
 
 class Generator(nn.Module):
     """Generator network."""
-    def __init__(self, conv_dim=1024, c_dim=config.nfeature, repeat_num=6):
+    def __init__(self, conv_dim=64, c_dim=config.nfeature, repeat_num=6):
         super(Generator, self).__init__()
-        '''
-        #shape test
-        self.c1 = nn.ConvTranspose2d(config.nz+c_dim, conv_dim, kernel_size=4, stride=1, padding=0, bias=False) #612 , 1024
-        self.c2 = nn.ConvTranspose2d(1024, 512, kernel_size=4, stride=2, padding=1, bias=False)
-        self.c3 = nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1, bias=False)
-        self.c4 = nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1, bias=False)
-        self.c5 = nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1, bias=False)
-        self.c6 = nn.ConvTranspose2d(64, 3, kernel_size=4, stride=2, padding=1, bias=False)
-        '''
-
+        #self.c2 = nn.ConvTranspose2d(config.nz+c_dim, conv_dim, kernel_size=4, stride=1, padding=0, bias=False)
+        #self.c3 = nn.ConvTranspose2d(conv_dim, conv_dim*2, kernel_size=4, stride=2, padding=1, bias=False)
         layers = []
         layers.append(nn.ConvTranspose2d(config.nz+c_dim, conv_dim, kernel_size=4, stride=1, padding=0, bias=False))
         layers.append(nn.InstanceNorm2d(conv_dim, affine=True, track_running_stats=True))
         layers.append(nn.ReLU(inplace=True))
 
-        # Down-sampling layers.
         curr_dim = conv_dim
-        for i in range(2):
-            layers.append(nn.ConvTranspose2d(curr_dim, curr_dim// 2, kernel_size=4, stride=2, padding=1, bias=False))
-            layers.append(nn.InstanceNorm2d(curr_dim// 2, affine=True, track_running_stats=True))
+        for i in range(3):
+            layers.append(nn.ConvTranspose2d(curr_dim, curr_dim * 2, kernel_size=4, stride=2, padding=1, bias=False))
+            layers.append(nn.InstanceNorm2d(curr_dim * 2, affine=True, track_running_stats=True))
             layers.append(nn.ReLU(inplace=True))
-            curr_dim = curr_dim // 2
+            curr_dim = curr_dim * 2
 
         # Bottleneck layers.
         for i in range(repeat_num):
@@ -80,7 +71,7 @@ class Generator(nn.Module):
             layers.append(nn.ReLU(inplace=True))
             curr_dim = curr_dim // 2
 
-        layers.append(nn.ConvTranspose2d(curr_dim, 3, kernel_size=4, stride=2, padding=1, bias=False))
+        layers.append(nn.Conv2d(curr_dim, 3, kernel_size=7, stride=1, padding=3, bias=False))
         layers.append(nn.Tanh())
         self.main = nn.Sequential(*layers)
 
@@ -90,69 +81,59 @@ class Generator(nn.Module):
         # This is because instance normalization ignores the shifting (or bias) effect.
         c = c.view(-1, config.nfeature, 1, 1)
         x = torch.cat([x, c], dim=1)
-        #test shape
-        '''
-        x = self.c1(x) # [10,612,1,1]
-        x = self.c2(x) # -> 10 1024 4 4
-        x = self.c3(x) # -> 10 512 8 8
-        x = self.c4(x) # -> 10 256 16 16
-        x = self.c5(x) # -> 10 128 32 32
-        x = self.c6(x) # -> 10 3 128 128
-        '''
-        return self.main(x)
+        x = self.main(x)
+        return x
 
 class StyleEncoder(nn.Module):
-    def __init__(self):
+    def __init__(self, conv_dim=64, c_dim=config.nfeature, repeat_num=6):
         super(StyleEncoder, self).__init__()
-        self.first = nn.Conv2d(3, 64, 4, 2, 1, bias=False)
-        self.main = nn.Sequential(
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, 128, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(128, 256, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(256, 512, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(512),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(512, 1024, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(1024),
-            nn.LeakyReLU(0.2, inplace=True),
-        )
-        self.last = nn.Conv2d(1024, 512, 4, 1, 0, bias=False)
+        layers = []
+        layers.append(nn.Conv2d(config.nc, conv_dim, kernel_size=4, stride=2, padding=1, bias=False))
+        layers.append(nn.InstanceNorm2d(conv_dim, affine=True, track_running_stats=True))
+        layers.append(nn.ReLU(inplace=True))
+        curr_dim = conv_dim
+        for i in range(repeat_num):
+            layers.append(nn.Conv2d(curr_dim, curr_dim * 2, kernel_size=4, stride=2, padding=1, bias=False))
+            layers.append(nn.InstanceNorm2d(curr_dim * 2, affine=True, track_running_stats=True))
+            layers.append(nn.ReLU(inplace=True))
+            curr_dim = curr_dim * 2
+
+        layers.append(nn.Conv2d(curr_dim, c_dim, kernel_size=3, stride=1, padding=1, bias=False))
+        self.main = nn.Sequential(*layers)
+
+        fc_layers = []
+        for i in range(repeat_num):
+            fc_layers.append(nn.Linear(c_dim, c_dim))
+        self.fc_layers = nn.Sequential(*fc_layers)
 
     def forward(self, x):
-        #update the wieghts
-        x = self.first(x)
-        x = self.main(x) #[10, 1024, 4,4]
-        s = self.last(x) #what dimension ?
-        return s.squeeze(3).squeeze(2)
+        x = self.main(x)
+        #s = self.fc_layers(x.squeeze(3).squeeze(2))
+        return x.squeeze(3).squeeze(2)
 
 class Discriminator(nn.Module):
-    """Discriminator network with PatchGAN."""
-    def __init__(self, conv_dim=64, c_dim=config.nfeature, repeat_num=6):
+    def __init__(self, conv_dim=64, repeat_num=6):
         super(Discriminator, self).__init__()
         self.feature_input = nn.Linear(config.nfeature, 128 * 128)
         layers = []
-        layers.append(nn.Conv2d(config.nc+1, conv_dim, kernel_size=4, stride=2, padding=1))
-        layers.append(nn.LeakyReLU(0.01))
-
+        layers.append(nn.Conv2d(config.nc , conv_dim, kernel_size=4, stride=2, padding=1, bias=False))
+        layers.append(nn.InstanceNorm2d(conv_dim, affine=True, track_running_stats=True))
+        layers.append(nn.ReLU(inplace=True))
         curr_dim = conv_dim
         for i in range(1, repeat_num):
             layers.append(nn.Conv2d(curr_dim, curr_dim * 2, kernel_size=4, stride=2, padding=1))
             layers.append(nn.LeakyReLU(0.01))
             curr_dim = curr_dim * 2
 
-        self.main = nn.Sequential(*layers)
-        self.conv1 = nn.Conv2d(curr_dim, 1, kernel_size=4, stride=1, padding=1, bias=False)
+        layers.append(nn.Conv2d(curr_dim, 1, kernel_size=4, stride=2, padding=1, bias=False))
 
-    def forward(self, x, attr):
-        attr = self.feature_input(attr).view(-1, 1, 128, 128)
-        x = torch.cat([x,attr], 1)
-        h = self.main(x)
-        out_src = self.conv1(h)
-        return out_src.view(-1, 1)
+        self.main = nn.Sequential(*layers)
+
+    def forward(self, x):
+        #attr = self.feature_input(attr).view(-1, 1, 128, 128)
+        #x = torch.cat([x, attr], 1)
+        x = self.main(x)
+        return x.view(-1, 1)
 
 def get_infinite_batches(data_loader):
     while True:
@@ -199,7 +180,7 @@ class Trainer:
         first_person = Variable(torch.FloatTensor(config.batch_size, config.nc, 128, 128))
 
         for epoch in range(config.nepoch):
-            for i in range(199):
+            for i in range(99):
                 # train discriminator
                 self.discriminator.zero_grad()
 
@@ -218,35 +199,29 @@ class Trainer:
                 profile = Variable(profile_image_cropped.cuda())
 
                 style = self.styleencoder(profile)
-                style = Variable(style.cuda())
+                front_style = self.styleencoder(real)
+                #style = Variable(style.cuda())
                 #train discriminator
-                d_real = self.discriminator(real, style)
+                d_real = self.discriminator(real)
                 fake = self.generator(noise, style)
-                d_fake = self.discriminator(fake.detach(), style)  # not update generator
-
+                d_fake = self.discriminator(fake.detach())  # not update generator
                 d_loss = self.loss(d_real, label_real) + self.loss(d_fake, label_fake)  # real label
-                d_loss.backward()
+                d_loss.backward(retain_graph=True)
                 self.optimizer_d.step()
 
                 # train generator, styleencoder
                 self.generator.zero_grad()
                 self.styleencoder.zero_grad()
-                front_style = self.styleencoder(real)
-                d_fake = self.discriminator(fake, style)
-                emb_real = self.get_embedding_from_image(front_image_cropped)
-                emb_fake = self.get_embedding_from_image(fake.cpu())
+                d_fake = self.discriminator(fake)
                 #s1_loss = torch.mean(torch.abs(style-front_style))
                 #s2_loss = torch.mean(torch.abs(real-fake))
                 #s3_loss = torch.mean(torch.abs(self.styleencoder(previous_f)-front_style)) + torch.mean(torch.abs(self.styleencoder(previous_p)-style))
-                #s4_loss = nn.MSELoss(emb_real.cuda(), emb_fake.cuda())
-                #s4_loss = torch.mean(torch.abs(emb_real-emb_fake)).cuda()
+                #s4_loss = torch.mean(torch.abs(front_style-self.styleencoder(fake)))
                 g_loss = self.loss(d_fake, label_real)  # trick the fake into being real
                 g_s_loss = g_loss #+ s4_loss
                 g_s_loss.backward()
                 self.optimizer_g.step()
                 self.optimizer_s.step()
-                previous_f = real
-                previous_p = profile
                 if i==0:
                     first_person = fake.data
             print("epoch{:03d} d_real: {}, d_fake: {}".format(epoch, d_real.mean(), d_fake.mean()))
@@ -254,12 +229,12 @@ class Trainer:
             vutils.save_image(real.data, '{}/real_result_epoch_{:03d}.png'.format(config.result_dir, epoch), normalize=True)
             vutils.save_image(first_person, '{}/first_person_result_epoch_{:03d}.png'.format(config.result_dir, epoch), normalize=True)
             if epoch == 49:
-                torch.save(self.generator.state_dict(), 'generator_param_50.pkl')
-                torch.save(self.discriminator.state_dict(), 'discriminator_param_50.pkl')
-                torch.save(self.styleencoder.state_dict(), 'styleencoder_param_50.pkl')
-        torch.save(self.generator.state_dict(), 'generator_param_100.pkl')
-        torch.save(self.discriminator.state_dict(), 'discriminator_param_100.pkl')
-        torch.save(self.styleencoder.state_dict(), 'styleencoder_param_100.pkl')
+                torch.save(self.generator.state_dict(), 'generator_param_50.ckpt')
+                torch.save(self.discriminator.state_dict(), 'discriminator_param_50.ckpt')
+                torch.save(self.styleencoder.state_dict(), 'styleencoder_param_50.ckpt')
+        torch.save(self.generator.state_dict(), 'generator_param_100.ckpt')
+        torch.save(self.discriminator.state_dict(), 'discriminator_param_100.ckpt')
+        torch.save(self.styleencoder.state_dict(), 'styleencoder_param_100.ckpt')
 
 import torch.utils.data
 from dataset import *
