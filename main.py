@@ -13,7 +13,7 @@ parser.add_argument('--batch_size', type=int, default=10)
 parser.add_argument('--nepoch', type=int, default=100)
 parser.add_argument('--nz', type=int, default=100) # number of noise dimension
 parser.add_argument('--nc', type=int, default=3) # number of result channel
-parser.add_argument('--nfeature', type=int, default=64) # num of embedding
+parser.add_argument('--nfeature', type=int, default=512) # num of embedding
 parser.add_argument('--lr', type=float, default=0.0002)
 betas = (0.0, 0.99) # adam optimizer beta1, beta2
 
@@ -60,10 +60,11 @@ class Generator(nn.Module):
             layers.append(nn.ReLU(inplace=True))
             curr_dim = curr_dim * 2
 
+        '''
         # Bottleneck layers.
         for i in range(repeat_num):
             layers.append(ResidualBlock(dim_in=curr_dim, dim_out=curr_dim))
-
+        '''
         # Up-sampling layers.
         for i in range(2):
             layers.append(nn.ConvTranspose2d(curr_dim, curr_dim//2, kernel_size=4, stride=2, padding=1, bias=False))
@@ -84,39 +85,12 @@ class Generator(nn.Module):
         x = self.main(x)
         return x
 
-class StyleEncoder(nn.Module):
-    def __init__(self, conv_dim=64, c_dim=config.nfeature, repeat_num=6):
-        super(StyleEncoder, self).__init__()
-        layers = []
-        layers.append(nn.Conv2d(config.nc, conv_dim, kernel_size=4, stride=2, padding=1, bias=False))
-        layers.append(nn.InstanceNorm2d(conv_dim, affine=True, track_running_stats=True))
-        layers.append(nn.ReLU(inplace=True))
-        curr_dim = conv_dim
-        for i in range(repeat_num):
-            layers.append(nn.Conv2d(curr_dim, curr_dim * 2, kernel_size=4, stride=2, padding=1, bias=False))
-            layers.append(nn.InstanceNorm2d(curr_dim * 2, affine=True, track_running_stats=True))
-            layers.append(nn.ReLU(inplace=True))
-            curr_dim = curr_dim * 2
-
-        layers.append(nn.Conv2d(curr_dim, c_dim, kernel_size=3, stride=1, padding=1, bias=False))
-        self.main = nn.Sequential(*layers)
-
-        fc_layers = []
-        for i in range(repeat_num):
-            fc_layers.append(nn.Linear(c_dim, c_dim))
-        self.fc_layers = nn.Sequential(*fc_layers)
-
-    def forward(self, x):
-        x = self.main(x)
-        #s = self.fc_layers(x.squeeze(3).squeeze(2))
-        return x.squeeze(3).squeeze(2)
-
 class Discriminator(nn.Module):
     def __init__(self, conv_dim=64, repeat_num=6):
         super(Discriminator, self).__init__()
         self.feature_input = nn.Linear(config.nfeature, 128 * 128)
         layers = []
-        layers.append(nn.Conv2d(config.nc , conv_dim, kernel_size=4, stride=2, padding=1, bias=False))
+        layers.append(nn.Conv2d(config.nc+1, conv_dim, kernel_size=4, stride=2, padding=1, bias=False))
         layers.append(nn.InstanceNorm2d(conv_dim, affine=True, track_running_stats=True))
         layers.append(nn.ReLU(inplace=True))
         curr_dim = conv_dim
@@ -129,9 +103,9 @@ class Discriminator(nn.Module):
 
         self.main = nn.Sequential(*layers)
 
-    def forward(self, x):
-        #attr = self.feature_input(attr).view(-1, 1, 128, 128)
-        #x = torch.cat([x, attr], 1)
+    def forward(self, x, attr):
+        attr = self.feature_input(attr).view(-1, 1, 128, 128)
+        x = torch.cat([x, attr], 1)
         x = self.main(x)
         return x.view(-1, 1)
 
@@ -144,16 +118,13 @@ class Trainer:
     def __init__(self):
         self.generator = Generator()
         self.discriminator = Discriminator()
-        self.styleencoder = StyleEncoder()
         self.mtcnn = MTCNN(image_size=128, margin=20)
         self.resnet = InceptionResnetV1(pretrained='vggface2').eval()
         self.loss = nn.MSELoss()
         self.optimizer_g = optim.Adam(self.generator.parameters(), lr=config.lr, betas=betas)
         self.optimizer_d = optim.Adam(self.discriminator.parameters(), lr=config.lr, betas=betas)
-        self.optimizer_s = optim.Adam(self.styleencoder.parameters(), lr=config.lr, betas=betas)
         self.generator.cuda()
         self.discriminator.cuda()
-        self.styleencoder.cuda()
         self.loss.cuda()
 
     def get_cropped_image(self, image):
@@ -168,7 +139,10 @@ class Trainer:
         for i in range(cropped_image.size(0)):
             embeddings.append(self.resnet(cropped_image[i].unsqueeze(0)))
         embeddings = torch.cat(embeddings)
-        return embeddings
+        embeddings = Variable(embeddings.cuda())
+        attr = torch.sigmoid(embeddings)
+        attr = attr * embeddings
+        return attr
 
     def train(self):
         noise = Variable(torch.FloatTensor(config.batch_size, config.nz, 1, 1).cuda())
@@ -198,21 +172,19 @@ class Trainer:
                 real = Variable(front_image_cropped.cuda())
                 profile = Variable(profile_image_cropped.cuda())
 
-                style = self.styleencoder(profile)
-                front_style = self.styleencoder(real)
-                #style = Variable(style.cuda())
+                attr = self.get_embedding_from_image(profile_image_cropped)
+
                 #train discriminator
-                d_real = self.discriminator(real)
-                fake = self.generator(noise, style)
-                d_fake = self.discriminator(fake.detach())  # not update generator
+                d_real = self.discriminator(real, attr)
+                fake = self.generator(noise, attr)
+                d_fake = self.discriminator(fake.detach(), attr)  # not update generator
                 d_loss = self.loss(d_real, label_real) + self.loss(d_fake, label_fake)  # real label
                 d_loss.backward(retain_graph=True)
                 self.optimizer_d.step()
 
                 # train generator, styleencoder
                 self.generator.zero_grad()
-                self.styleencoder.zero_grad()
-                d_fake = self.discriminator(fake)
+                d_fake = self.discriminator(fake, attr)
                 #s1_loss = torch.mean(torch.abs(style-front_style))
                 #s2_loss = torch.mean(torch.abs(real-fake))
                 #s3_loss = torch.mean(torch.abs(self.styleencoder(previous_f)-front_style)) + torch.mean(torch.abs(self.styleencoder(previous_p)-style))
@@ -221,7 +193,6 @@ class Trainer:
                 g_s_loss = g_loss #+ s4_loss
                 g_s_loss.backward()
                 self.optimizer_g.step()
-                self.optimizer_s.step()
                 if i==0:
                     first_person = fake.data
             print("epoch{:03d} d_real: {}, d_fake: {}".format(epoch, d_real.mean(), d_fake.mean()))
@@ -231,10 +202,8 @@ class Trainer:
             if epoch == 49:
                 torch.save(self.generator.state_dict(), 'generator_param_50.ckpt')
                 torch.save(self.discriminator.state_dict(), 'discriminator_param_50.ckpt')
-                torch.save(self.styleencoder.state_dict(), 'styleencoder_param_50.ckpt')
         torch.save(self.generator.state_dict(), 'generator_param_100.ckpt')
         torch.save(self.discriminator.state_dict(), 'discriminator_param_100.ckpt')
-        torch.save(self.styleencoder.state_dict(), 'styleencoder_param_100.ckpt')
 
 import torch.utils.data
 from dataset import *
