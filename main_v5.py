@@ -1,7 +1,6 @@
-#attention 추가
+#residual version
 import argparse
-import time as t
-from torch.utils.tensorboard import SummaryWriter
+
 parser = argparse.ArgumentParser("cDCGAN")
 
 parser.add_argument('--dataset_dir', type=str, default='/home/ubuntu/dataset')
@@ -25,47 +24,79 @@ import torchvision.utils as vutils
 import torchvision.transforms as transforms
 from torch.autograd import Variable
 from math import sqrt
-from facenet_pytorch import InceptionResnetV1, MTCNN# If required, create a face detection pipeline using MTCNN:
-import cv2
-import numpy as np
+from facenet_pytorch import MTCNN, InceptionResnetV1# If required, create a face detection pipeline using MTCNN:
+
+class ResidualBlock(nn.Module):
+    """Residual Block with instance normalization."""
+    def __init__(self, dim_in, dim_out):
+        super(ResidualBlock, self).__init__()
+        self.main = nn.Sequential(
+            nn.Conv2d(dim_in, dim_out, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.InstanceNorm2d(dim_out, affine=True, track_running_stats=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim_out, dim_out, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.InstanceNorm2d(dim_out, affine=True, track_running_stats=True))
+
+    def forward(self, x):
+        return x + self.main(x)
 
 class Generator(nn.Module):
-
-    def __init__(self):
+    """Generator network."""
+    def __init__(self, conv_dim=1024, c_dim=config.nfeature, repeat_num=6):
         super(Generator, self).__init__()
-        #self.fc = nn.Linear(512, 100)
-        #self.W = nn.Parameter(0.01 * torch.randn(1, 100, 8, 8, 100))
-        self.main = nn.Sequential(
-            nn.ConvTranspose2d(config.nz + config.nfeature, 1024, 4, 1, 0, bias=False),
-            nn.BatchNorm2d(1024),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(1024, 512, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(512),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(512, 256, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(256, 128, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(128, 64, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(64, config.nc, 4, 2, 1, bias=False),
-            nn.Tanh(),
-        )
-
-    def forward(self, x, style): #attr ( 1, 512)
         '''
-        style = squash(style)
-        style = self.fc(style)
-        style = style.view(-1, 1, 1, 100, 1)
-        u = style.repeat(1, 1, 8, 1, 1)
-        u_hat = torch.matmul(self.W, u)
+        #shape test
+        self.c1 = nn.ConvTranspose2d(config.nz+c_dim, conv_dim, kernel_size=4, stride=1, padding=0, bias=False) #612 , 1024
+        self.c2 = nn.ConvTranspose2d(1024, 512, kernel_size=4, stride=2, padding=1, bias=False)
+        self.c3 = nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1, bias=False)
+        self.c4 = nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1, bias=False)
+        self.c5 = nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1, bias=False)
+        self.c6 = nn.ConvTranspose2d(64, 3, kernel_size=4, stride=2, padding=1, bias=False)
         '''
-        style = style.view(-1, config.nfeature, 1, 1) #(10, 512, 1, 1)
-        x = torch.cat([x, style], 1) #(10 , 612, 1,1)
 
+        layers = []
+        layers.append(nn.ConvTranspose2d(config.nz+c_dim, conv_dim, kernel_size=4, stride=1, padding=0, bias=False))
+        layers.append(nn.InstanceNorm2d(conv_dim, affine=True, track_running_stats=True))
+        layers.append(nn.ReLU(inplace=True))
+
+        # Down-sampling layers.
+        curr_dim = conv_dim
+        for i in range(2):
+            layers.append(nn.ConvTranspose2d(curr_dim, curr_dim// 2, kernel_size=4, stride=2, padding=1, bias=False))
+            layers.append(nn.InstanceNorm2d(curr_dim// 2, affine=True, track_running_stats=True))
+            layers.append(nn.ReLU(inplace=True))
+            curr_dim = curr_dim // 2
+
+        # Bottleneck layers.
+        for i in range(repeat_num):
+            layers.append(ResidualBlock(dim_in=curr_dim, dim_out=curr_dim))
+
+        # Up-sampling layers.
+        for i in range(2):
+            layers.append(nn.ConvTranspose2d(curr_dim, curr_dim//2, kernel_size=4, stride=2, padding=1, bias=False))
+            layers.append(nn.InstanceNorm2d(curr_dim//2, affine=True, track_running_stats=True))
+            layers.append(nn.ReLU(inplace=True))
+            curr_dim = curr_dim // 2
+
+        layers.append(nn.ConvTranspose2d(curr_dim, 3, kernel_size=4, stride=2, padding=1, bias=False))
+        layers.append(nn.Tanh())
+        self.main = nn.Sequential(*layers)
+
+    def forward(self, x, c):
+        # Replicate spatially and concatenate domain information.
+        # Note that this type of label conditioning does not work at all if we use reflection padding in Conv2d.
+        # This is because instance normalization ignores the shifting (or bias) effect.
+        c = c.view(-1, config.nfeature, 1, 1)
+        x = torch.cat([x, c], dim=1)
+        #test shape
+        '''
+        x = self.c1(x) # [10,612,1,1]
+        x = self.c2(x) # -> 10 1024 4 4
+        x = self.c3(x) # -> 10 512 8 8
+        x = self.c4(x) # -> 10 256 16 16
+        x = self.c5(x) # -> 10 128 32 32
+        x = self.c6(x) # -> 10 3 128 128
+        '''
         return self.main(x)
 
 class StyleEncoder(nn.Module):
@@ -80,32 +111,21 @@ class StyleEncoder(nn.Module):
             nn.Conv2d(128, 256, 4, 2, 1, bias=False),
             nn.BatchNorm2d(256),
             nn.LeakyReLU(0.2, inplace=True),
-        )
-        self.attention = nn.Conv2d(256, 1, 1, 1, 0)
-
-        self.last = nn.Sequential(
             nn.Conv2d(256, 512, 4, 2, 1, bias=False),
             nn.BatchNorm2d(512),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(512, 1024, 4, 2, 1, bias=False),
             nn.BatchNorm2d(1024),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(1024, 512, 4, 1, 0, bias=False)
         )
+        self.last = nn.Conv2d(1024, 512, 4, 1, 0, bias=False)
 
     def forward(self, x):
         #update the wieghts
         x = self.first(x)
         x = self.main(x) #[10, 1024, 4,4]
-        attr = self.attention(x)
-        attr = torch.sigmoid(attr)
-        s = attr * x
-        s = self.last(s) #what dimension ?
-        s = s.squeeze(3).squeeze(2)
-        #attr= torch.softmax(s,1)
-        #attr= attr * s
-        #
-        return s
+        s = self.last(x) #what dimension ?
+        return s.squeeze(3).squeeze(2)
 
 class Discriminator(nn.Module):
     def __init__(self):
@@ -155,27 +175,15 @@ class Trainer:
         self.generator.cuda()
         self.discriminator.cuda()
         self.styleencoder.cuda()
-        #self.resnet.cuda()
-        #self.mtcnn.cuda()
         self.loss.cuda()
-
-        # Set the logger
-        self.dir_name = t.strftime('~%Y%m%d~%H%M%S', t.localtime(t.time()))
-        self.log_train = './paper_log/' + self.dir_name + '/train'
-        self.writer = SummaryWriter(self.log_train)
 
     def get_cropped_image(self, image):
         images = []
         for i in range(image.size(0)):
             images.append(self.mtcnn(torchvision.transforms.ToPILImage()(image[i])))
-        images = torch.cat(images).view(10, 3, 128, 128)
-        return Variable(images.cuda())
-        '''
-        images = [transforms.ToPILImage()(image_) for image_ in image]
-        images = self.mtcnn(images)
         images = torch.cat(images).view(10, 3, 128,128)
-        return Variable(images.cuda())
-        '''
+        return images
+
     def get_embedding_from_image(self, cropped_image):
         embeddings=[]
         for i in range(cropped_image.size(0)):
@@ -190,24 +198,26 @@ class Trainer:
         ds = Dataset(config)
         profile_data = get_infinite_batches(ds.load_dataset())
         front_data = get_infinite_batches(ds.load_front_dataset())
+        first_person = Variable(torch.FloatTensor(config.batch_size, config.nc, 128, 128))
 
         for epoch in range(config.nepoch):
             for i in range(199):
                 # train discriminator
                 self.discriminator.zero_grad()
+
                 profile_image = profile_data.__next__()
                 front_image = front_data.__next__().repeat(config.batch_size, 1, 1, 1)
 
-                batch_size = config.batch_size
+                batch_size = profile_image.size(0)
                 label_real.data.resize(batch_size, 1).fill_(1)
                 label_fake.data.resize(batch_size, 1).fill_(0)
                 noise.data.resize_(batch_size, config.nz, 1, 1).normal_(0, 1)
 
-                profile = self.get_cropped_image(profile_image)
-                real = self.get_cropped_image(front_image)
+                profile_image_cropped = self.get_cropped_image(profile_image)
+                front_image_cropped = self.get_cropped_image(front_image)
 
-                #profile = Variable(profile_image.cuda())
-                #real = Variable(front_image.cuda())
+                real = Variable(front_image_cropped.cuda())
+                profile = Variable(profile_image_cropped.cuda())
 
                 style = self.styleencoder(profile)
                 style = Variable(style.cuda())
@@ -219,60 +229,38 @@ class Trainer:
                 d_loss = self.loss(d_real, label_real) + self.loss(d_fake, label_fake)  # real label
                 d_loss.backward()
                 self.optimizer_d.step()
+
                 # train generator, styleencoder
                 self.generator.zero_grad()
                 self.styleencoder.zero_grad()
-                #fake = self.generator(noise, style)
+                front_style = self.styleencoder(real)
                 d_fake = self.discriminator(fake, style)
-                #emb_real = self.get_embedding_from_image(front_image_cropped)
-                #emb_fake = self.get_embedding_from_image(fake.cpu())
+                emb_real = self.get_embedding_from_image(front_image_cropped)
+                emb_fake = self.get_embedding_from_image(fake.cpu())
                 #s1_loss = torch.mean(torch.abs(style-front_style))
                 #s2_loss = torch.mean(torch.abs(real-fake))
                 #s3_loss = torch.mean(torch.abs(self.styleencoder(previous_f)-front_style)) + torch.mean(torch.abs(self.styleencoder(previous_p)-style))
-                #s4_loss = torch.mean(torch.abs(emb_real-emb_fake)).cuda()
-                # recon_loss
-                '''
-                fake_front_style = self.styleencoder(fake)
-                reconstruct = self.generator(noise, fake_front_style)
-                reconstruct_loss = self.loss(reconstruct, real)
-                '''
+                s4_loss = torch.mean(torch.abs(emb_real-emb_fake)).cuda()
                 g_loss = self.loss(d_fake, label_real)  # trick the fake into being real
-                g_s_loss = g_loss  # s4_loss
+                g_s_loss = g_loss + s4_loss
                 g_s_loss.backward()
                 self.optimizer_g.step()
                 self.optimizer_s.step()
-                if i % 10 == 0:
-                    # Testing
-                    x_fake = fake + 1
-                    x_real = real + 1
-                    #x_recon = reconstruct + 1
-                    x_fake = x_fake - x_fake.min()
-                    x_real = x_real - x_real.min()
-                    #x_recon = x_recon - x_recon.min()
-                    x_fake = x_fake / (x_fake.max() - x_fake.min())
-                    x_real = x_real / (x_real.max() - x_real.min())
-                    #x_recon = x_recon / (x_recon.max() - x_recon.min())
-
-                    mse = torch.mean((x_fake - x_real) **2)
-                    psnr = 20 * torch.log10(255.0 / torch.sqrt(mse))
-
-                    self.writer.add_scalar('d_loss', d_loss, ((epoch) * 190) + i)
-                    self.writer.add_scalar('g_loss', g_loss, ((epoch) * 190) + i)
-                    #self.writer.add_scalar('recon_loss', reconstruct_loss, ((epoch) * 190) + i)
-                    self.writer.add_scalar('total_g_loss', g_s_loss, ((epoch) * 190) + i)
-                    self.writer.add_scalar('psnr', psnr, ((epoch) * 190) + i)
-                    self.writer.add_images('fake_image', x_fake, ((epoch) * 190) + i)
-                    self.writer.add_images('real_image', x_real, ((epoch) * 190) + i)
-                    #self.writer.add_images('recon_image', x_recon, ((epoch) * 190) + i)
-                    print("d_loss:{}, g_loss:{},  g_s_loss:{}".format(d_loss, g_loss, g_s_loss))
+                previous_f = real
+                previous_p = profile
+                if i==0:
+                    first_person = fake.data
             print("epoch{:03d} d_real: {}, d_fake: {}".format(epoch, d_real.mean(), d_fake.mean()))
             vutils.save_image(fake.data, '{}/fake_result_epoch_{:03d}.png'.format(config.result_dir, epoch), normalize=True)
             vutils.save_image(real.data, '{}/real_result_epoch_{:03d}.png'.format(config.result_dir, epoch), normalize=True)
-            if epoch >= 40:
-                torch.save(self.generator.state_dict(), 'paper_save_model/1_generator_param_%d.pth' % epoch)
-                torch.save(self.discriminator.state_dict(), 'paper_save_model/1_discriminator_param_%d.pth' % epoch)
-                torch.save(self.styleencoder.state_dict(), 'paper_save_model/1_styleencoder_param_%d.pth' % epoch)
-        self.writer.close()
+            vutils.save_image(first_person, '{}/first_person_result_epoch_{:03d}.png'.format(config.result_dir, epoch), normalize=True)
+            if epoch == 49:
+                torch.save(self.generator.state_dict(), 'generator_param_50.pkl')
+                torch.save(self.discriminator.state_dict(), 'discriminator_param_50.pkl')
+                torch.save(self.styleencoder.state_dict(), 'styleencoder_param_50.pkl')
+        torch.save(self.generator.state_dict(), 'generator_param_100.pkl')
+        torch.save(self.discriminator.state_dict(), 'discriminator_param_100.pkl')
+        torch.save(self.styleencoder.state_dict(), 'styleencoder_param_100.pkl')
 
 import torch.utils.data
 from dataset import *
